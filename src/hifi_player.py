@@ -25,6 +25,7 @@ from typing import Optional, Tuple, List, Callable
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
+from scipy.signal import upfirdn, lfilter, resample_poly
 import tkinter as tk
 from tkinter import filedialog, ttk, messagebox
 
@@ -68,6 +69,7 @@ class WindowsAudioOptimizations:
 
     _mmcss_handle = None
     _memory_locked = False
+    _original_power_scheme = None
 
     @staticmethod
     def set_process_priority_high():
@@ -84,7 +86,7 @@ class WindowsAudioOptimizations:
 
     @staticmethod
     def set_mmcss_pro_audio():
-        """Set current thread to MMCSS 'Pro Audio' priority (level 23-26).
+        """Set current thread to MMCSS 'Pro Audio' priority.
         Must be called from the audio callback thread."""
         if not IS_WINDOWS:
             return
@@ -96,7 +98,8 @@ class WindowsAudioOptimizations:
             handle = avrt.AvSetMmThreadCharacteristicsW(
                 "Pro Audio", ctypes.byref(task_index))
             if handle:
-                avrt.AvSetMmThreadPriority(handle, 2)  # AVRT_PRIORITY_CRITICAL
+                # 2 = AVRT_PRIORITY_HIGH (CRITICAL is 3 but is not recommended)
+                avrt.AvSetMmThreadPriority(handle, 2)
                 WindowsAudioOptimizations._mmcss_handle = handle
         except Exception:
             pass
@@ -156,11 +159,19 @@ class WindowsAudioOptimizations:
 
     @staticmethod
     def optimize_power():
-        """Set high performance power settings during playback."""
+        """Activate a high-performance power plan during playback.
+        The original plan GUID is remembered so restore_power() can undo it."""
         if not IS_WINDOWS:
             return
         try:
             import subprocess
+            import re
+            # Remember the active scheme so we can restore it later
+            result = subprocess.run(['powercfg', '/getactivescheme'],
+                                    capture_output=True, text=True)
+            m = re.search(r'([0-9a-fA-F-]{36})', result.stdout or '')
+            if m:
+                WindowsAudioOptimizations._original_power_scheme = m.group(1)
             # Try to activate Ultimate Performance power plan
             result = subprocess.run(
                 ['powercfg', '-duplicatescheme',
@@ -183,6 +194,20 @@ class WindowsAudioOptimizations:
         except Exception:
             pass
 
+    @staticmethod
+    def restore_power():
+        """Restore the power plan that was active before playback."""
+        if not IS_WINDOWS:
+            return
+        try:
+            import subprocess
+            guid = WindowsAudioOptimizations._original_power_scheme
+            if guid:
+                subprocess.run(['powercfg', '/setactive', guid], capture_output=True)
+                WindowsAudioOptimizations._original_power_scheme = None
+        except Exception:
+            pass
+
 
 # ============================================================
 # DSP: Sinc Oversampler
@@ -192,40 +217,42 @@ class SincOversampler:
     def __init__(self, num_taps=8192):
         self.num_taps = num_taps
 
-    def design_filter(self, num_taps: int, cutoff: float) -> np.ndarray:
+    def design_filter(self, num_taps: int, cutoff: float, gain: float = 1.0) -> np.ndarray:
+        """Windowed-sinc FIR, normalized to DC gain `gain` (factor for oversampling)."""
         if num_taps % 2 == 0:
             num_taps += 1
         n = np.arange(num_taps) - (num_taps - 1) / 2.0
         with np.errstate(divide="ignore", invalid="ignore"):
             h = np.sinc(2.0 * cutoff * n)
+        # Window phase must use the sample INDEX (0..N-1), not the centered n,
+        # so the window peak lands on the sinc center
+        k = np.arange(num_taps)
         window = (
             0.35875
-            - 0.48829 * np.cos(2 * np.pi * n / (num_taps - 1))
-            + 0.14128 * np.cos(4 * np.pi * n / (num_taps - 1))
-            - 0.01168 * np.cos(6 * np.pi * n / (num_taps - 1))
+            - 0.48829 * np.cos(2 * np.pi * k / (num_taps - 1))
+            + 0.14128 * np.cos(4 * np.pi * k / (num_taps - 1))
+            - 0.01168 * np.cos(6 * np.pi * k / (num_taps - 1))
         )
         h *= window
-        h /= np.sum(h)
+        h /= np.sum(h) / gain
         return h
 
     def oversample(self, data: np.ndarray, factor: int) -> np.ndarray:
+        """Polyphase oversampling — O(output) memory instead of O(song × factor) FFT.
+
+        The old implementation zero-stuffed the whole song and ran one giant FFT
+        (a 5-min 8x track needed ~1.7GB); upfirdn does the same math phase-by-phase.
+        """
         if factor == 1:
             return data.copy()
-        n_samples, n_channels = data.shape
-        n_output = n_samples * factor
+        n_output = data.shape[0] * factor
         cutoff = 0.9 / factor
-        filt = self.design_filter(min(self.num_taps, 16384), cutoff)
-        filt *= factor
-        stuffed = np.zeros((n_output, n_channels), dtype=np.float64)
-        stuffed[::factor] = data
-        fft_size = 1
-        while fft_size < n_output + len(filt):
-            fft_size *= 2
-        H = np.fft.rfft(filt, fft_size)
-        result = np.zeros((n_output, n_channels), dtype=np.float64)
-        for ch in range(n_channels):
-            X = np.fft.rfft(stuffed[:, ch], fft_size)
-            result[:, ch] = np.fft.irfft(X * H, fft_size)[:n_output]
+        # Zero-stuffing spreads energy over `factor` images, so the filter
+        # needs DC gain = factor to restore original amplitude
+        filt = self.design_filter(self.num_taps, cutoff, gain=factor)
+        result = np.empty((n_output, data.shape[1]), dtype=np.float64)
+        for ch in range(data.shape[1]):
+            result[:, ch] = upfirdn(filt, data[:, ch], up=factor)[:n_output]
         return result
 
 
@@ -246,6 +273,12 @@ class DitherEngine:
 
     @staticmethod
     def apply_noise_shaped(data: np.ndarray, target_bits: int = 24, sr: int = 44100) -> np.ndarray:
+        """2nd-order highpass noise shaping via IIR error feedback.
+
+        The sample-by-sample recursion e2, e1 = e1, err is equivalent to
+        filtering the quantization error with 1/(1 - b1*z^-1 - b2*z^-2),
+        so lfilter gives identical output at C speed.
+        """
         if target_bits >= 32:
             return data.copy()
         n_samples, n_channels = data.shape
@@ -254,18 +287,14 @@ class DitherEngine:
         b1, b2 = -1.622, 0.642
         rng = np.random.default_rng()
         result = np.empty_like(data)
+        # Error-feedback denominator: y = x / (1 - b1*z^-1 - b2*z^-2) applied to error
+        a = [1.0, -b1, -b2]
         for ch in range(n_channels):
-            e1, e2 = 0.0, 0.0
-            ch_data = data[:, ch]
-            ch_result = np.empty(n_samples, dtype=np.float64)
             dithers = (rng.random(n_samples) + rng.random(n_samples) - 1.0) * lsb
-            for i in range(n_samples):
-                shaped = ch_data[i] + dithers[i] - (b1 * e1 + b2 * e2)
-                quantized = round(shaped * scale) / scale
-                err = shaped - quantized
-                e2, e1 = e1, err
-                ch_result[i] = min(max(quantized, -1.0), 1.0)
-            result[:, ch] = ch_result
+            quantized = np.round((data[:, ch] + dithers) * scale) / scale
+            err = data[:, ch] + dithers - quantized
+            shaped = quantized + lfilter([1.0], a, err)
+            result[:, ch] = np.clip(shaped, -1.0, 1.0)
         return result
 
 
@@ -304,7 +333,8 @@ class DSFReader:
         pcm_sr = 352800 if dsd_sr >= 5644800 else (176400 if dsd_sr >= 2822400 else 88200)
         decimation = dsd_sr // pcm_sr
         bytes_per_block_ch = block_size // ch_count
-        n_blocks = (sample_count + block_size * 8 - 1) // (block_size * 8)
+        # Per-block-per-channel DSD bits = bytes_per_block_ch * 8
+        n_blocks = (sample_count + bytes_per_block_ch * 8 - 1) // (bytes_per_block_ch * 8)
         channels = []
         for ch in range(ch_count):
             ch_bytes = bytearray()
@@ -312,6 +342,8 @@ class DSFReader:
                 o = blk * block_size + ch * bytes_per_block_ch
                 ch_bytes.extend(raw[o:o + bytes_per_block_ch])
             arr = np.frombuffer(bytes(ch_bytes[:sample_count // 8 + 1]), dtype=np.uint8)
+            # DSF bits are LSB-first within each byte; reverse before unpacking
+            arr = DoPEncoder._BITREV[arr]
             bits = np.unpackbits(arr)[:sample_count].astype(np.float64) * 2.0 - 1.0
             cutoff = 0.9 / decimation
             ntaps = min(8192, len(bits) // 4)
@@ -360,7 +392,8 @@ class DSFReader:
             data_size = struct.unpack("<Q", f.read(8))[0]
             raw = f.read(data_size - 12)
         bytes_per_block_ch = block_size // ch_count
-        n_blocks = (sample_count + block_size * 8 - 1) // (block_size * 8)
+        # Per-block-per-channel DSD bits = bytes_per_block_ch * 8
+        n_blocks = (sample_count + bytes_per_block_ch * 8 - 1) // (bytes_per_block_ch * 8)
         channels = []
         for ch in range(ch_count):
             ch_bytes = bytearray()
@@ -382,63 +415,56 @@ class DSFReader:
 # ============================================================
 
 class DoPEncoder:
-    """Encode raw DSD data into DoP (DSD over PCM) format.
-    DoP packs DSD bits into PCM frames with a marker byte.
-    The DAC recognizes the marker and extracts DSD directly — no conversion loss.
+    """Encode raw DSD data into DoP (DSD over PCM) frames — per DoP 1.1 spec.
 
-    DoP frame structure (per channel, per sample period):
-      Byte 0: Marker (0x05 for DSD, 0xFA for alternate)
-      Byte 1: Marker (0x05 / 0xFA)
-      Byte 2-3: DSD audio data (MSB first)
+    Frame layout (one 24-bit word per channel per PCM sample period):
+      bits 23-16: marker byte, alternates 0x05 / 0xFA each frame
+                  (the alternation lets the DAC lock onto the DSD stream)
+      bits 15-0:  16 DSD samples, MSB first
 
-    For stereo: L-frame, R-frame interleaved.
+    Carrier rate = DSD rate / 16: DSD64 (2.8224 MHz) -> 176.4 kHz,
+    DSD128 -> 352.8 kHz, DSD256 -> 705.6 kHz.
+
+    Returns int32 samples with the 24-bit DoP word placed in the TOP 24 bits
+    (word << 8), for direct output over an int32 ASIO/WASAPI stream.
+    No float conversion — float32 rounding would corrupt the DSD bitstream.
     """
 
     DOP_MARKER = 0x05
     DOP_MARKER_ALT = 0xFA
 
+    # DSF stores DSD bits LSB-first inside each byte; DoP requires MSB-first.
+    _BITREV = np.array(
+        [int(format(i, "08b")[::-1], 2) for i in range(256)], dtype=np.uint8)
+
     @staticmethod
     def encode(dsd_channels: List[np.ndarray], dsd_sr: int) -> Tuple[np.ndarray, int]:
-        """Encode raw DSD channel data into DoP PCM stream.
-
-        Args:
-            dsd_channels: List of uint8 arrays, one per channel (raw DSD bytes)
-            dsd_sr: DSD sample rate (e.g. 2822400 for DSD64)
+        """Encode raw DSD channel data (uint8 per channel) into DoP int32 frames.
 
         Returns:
-            (dop_data, pcm_sr) where dop_data is float32 PCM array for sounddevice,
-            pcm_sr is the DoP carrier sample rate
+            (dop_frames, pcm_sr): int32 array (n_frames, n_channels) with the
+            24-bit DoP word in the top 24 bits of each sample, and the DoP
+            carrier sample rate.
         """
         ch_count = len(dsd_channels)
-        min_bytes = min(len(ch) for ch in dsd_channels)
-        # DoP packs 2 DSD bytes per frame (16 DSD bits per PCM sample period)
-        # Each DoP frame = 1 marker byte + 1 marker byte + 2 DSD bytes = 4 bytes = 24bit PCM sample
-        n_frames = min_bytes // 2  # 2 DSD bytes per frame
+        n_frames = min(len(ch) for ch in dsd_channels) // 2  # 2 DSD bytes per frame
+        pcm_sr = dsd_sr // 16  # 16 DSD bits carried per PCM sample period
 
-        # DoP carrier rate = DSD rate / 16 (16 bits per PCM sample in DoP)
-        # DSD64 (2.8224MHz) → 176.4kHz, DSD128 → 352.8kHz, DSD256 → 705.6kHz
-        pcm_sr = dsd_sr // 16
+        # Markers alternate 0x05, 0xFA, 0x05, ... per frame
+        markers = np.where(np.arange(n_frames) % 2 == 0,
+                           DoPEncoder.DOP_MARKER,
+                           DoPEncoder.DOP_MARKER_ALT).astype(np.uint32)
 
-        # Build DoP frames as int32 array
-        # Each frame: 0x05 0x05 DSD_byte1 DSD_byte2 (big-endian 32-bit word)
-        dop_frames = np.zeros((n_frames, ch_count), dtype=np.int32)
-
+        frames = np.zeros((n_frames, ch_count), dtype=np.int32)
         for ch_idx in range(ch_count):
-            ch_data = dsd_channels[ch_idx][:n_frames * 2]
-            for i in range(n_frames):
-                b0 = ch_data[i * 2]       # first DSD byte
-                b1 = ch_data[i * 2 + 1]   # second DSD byte
-                # Pack: marker | marker | DSD_byte1 | DSD_byte2
-                # Big-endian: 0x05 0x05 xx xx
-                frame = (DoPEncoder.DOP_MARKER << 24) | (DoPEncoder.DOP_MARKER << 16) | (b0 << 8) | b1
-                dop_frames[i, ch_idx] = frame
-
-        # Convert int32 to float32 for sounddevice output
-        # Scale to [-1.0, 1.0) range preserving all 32 bits
-        dop_float = dop_frames.astype(np.float64) / 2147483648.0
-        dop_float = dop_float.astype(np.float32)
-
-        return dop_float, pcm_sr
+            raw = DoPEncoder._BITREV[dsd_channels[ch_idx][:n_frames * 2]]
+            b0 = raw[0::2].astype(np.uint32)  # first DSD byte (earliest 8 bits)
+            b1 = raw[1::2].astype(np.uint32)
+            word = (markers << 16) | (b0 << 8) | b1        # 24-bit DoP word
+            # << 8 places the word in the top 24 bits; view() reinterprets the
+            # uint32 bit pattern as int32 without any value conversion
+            frames[:, ch_idx] = (word << 8).view(np.int32)
+        return frames, pcm_sr
 
 
 # ============================================================
@@ -550,6 +576,10 @@ class AudioEngine:
         }
 
     def _preprocess(self):
+        # DoP / DSD Native data is a raw bitstream — any float cast or DSP
+        # would corrupt the marker/DSD bits. It is already final in _processed.
+        if self._is_dop or self._is_dsd_native:
+            return
         data = self._data.copy()
         if self.bit_perfect:
             self._processed = data.astype(np.float32)
@@ -599,7 +629,6 @@ class AudioEngine:
         # Apply Windows audio optimizations
         WindowsAudioOptimizations.set_process_priority_high()
         WindowsAudioOptimizations.optimize_power()
-        WindowsAudioOptimizations.lock_memory(self._processed)
         self._start_stream(device)
 
     def _start_stream(self, device=None):
@@ -616,6 +645,11 @@ class AudioEngine:
         self._output_mode = "Unknown"
         errors = []
 
+        # DoP streams must be int32: the 24-bit DoP word occupies the top bits
+        # of each sample and must reach the DAC bit-exact. Float conversion
+        # (float32 has a 24-bit mantissa) would round the marker/DSD bits.
+        dop_dtype = "int32" if self._is_dop else "float32"
+
         if IS_MACOS:
             # macOS: CoreAudio handles bit-perfect natively
             # No ASIO/WASAPI, just open at file's native rate
@@ -623,7 +657,7 @@ class AudioEngine:
                 try:
                     if attempt == 0:
                         self._stream = sd.OutputStream(
-                            samplerate=output_sr, channels=self._channels, dtype="float32",
+                            samplerate=output_sr, channels=self._channels, dtype=dop_dtype,
                             device=device, callback=self._audio_callback, blocksize=0,
                         )
                         self._stream.start()
@@ -638,7 +672,7 @@ class AudioEngine:
                                 self._processed_sr = native_sr
                                 output_sr = native_sr
                         self._stream = sd.OutputStream(
-                            samplerate=output_sr, channels=self._channels, dtype="float32",
+                            samplerate=output_sr, channels=self._channels, dtype=dop_dtype,
                             device=device, callback=self._audio_callback,
                         )
                         self._stream.start()
@@ -653,7 +687,7 @@ class AudioEngine:
             if self._is_dsd_native and is_asio:
                 try:
                     self._stream = sd.OutputStream(
-                        samplerate=output_sr, channels=self._channels, dtype="float32",
+                        samplerate=output_sr, channels=self._channels, dtype=dop_dtype,
                         device=device, callback=self._audio_callback, blocksize=1024,
                     )
                     self._stream.start()
@@ -668,7 +702,7 @@ class AudioEngine:
                 try:
                     if attempt == 0 and is_asio:
                         self._stream = sd.OutputStream(
-                            samplerate=output_sr, channels=self._channels, dtype="float32",
+                            samplerate=output_sr, channels=self._channels, dtype=dop_dtype,
                             device=device, callback=self._audio_callback, blocksize=1024,
                         )
                         self._stream.start()
@@ -681,7 +715,7 @@ class AudioEngine:
                         return
                     elif attempt == 1:
                         self._stream = sd.OutputStream(
-                            samplerate=output_sr, channels=self._channels, dtype="float32",
+                            samplerate=output_sr, channels=self._channels, dtype=dop_dtype,
                             device=device, callback=self._audio_callback, blocksize=0,
                             extra_settings=sd.WasapiSettings(exclusive=True),
                         )
@@ -721,16 +755,16 @@ class AudioEngine:
         raise RuntimeError(f"Cannot open audio device: {'; '.join(errors)}")
 
     def _resample_processed(self, target_sr: int) -> np.ndarray:
-        """Resample processed data to target sample rate using linear interpolation."""
+        """Resample processed data to target sample rate (polyphase, anti-aliased)."""
         if self._processed is None:
             return None
         src_len = len(self._processed)
         ratio = target_sr / self._processed_sr
         new_len = int(src_len * ratio)
-        indices = np.linspace(0, src_len - 1, new_len)
         result = np.zeros((new_len, self._channels), dtype=np.float32)
         for ch in range(self._channels):
-            result[:, ch] = np.interp(indices, np.arange(src_len), self._processed[:, ch])
+            result[:, ch] = resample_poly(
+                self._processed[:, ch], target_sr, self._processed_sr)
         return result
 
     def _audio_callback(self, outdata, frames, time_info, status):
@@ -750,15 +784,25 @@ class AudioEngine:
 
                 pos = self._pos; end = pos + frames; dlen = len(self._processed)
 
-                # DoP/DSD Native: data cannot be multiplied (would corrupt marker/DSD bytes)
-                # Output raw data directly, volume must be controlled at DAC/hardware level
+                # DoP/DSD Native: int32 bitstream, copied as raw bytes so the
+                # marker/DSD bits reach the DAC untouched. Volume is ignored
+                # (hardware volume only) — any scaling would corrupt the stream.
                 if self._is_dop or self._is_dsd_native:
+                    rem = dlen - pos
                     if end <= dlen:
-                        outdata[:] = self._processed[pos:end]
+                        chunk = self._processed[pos:end]
+                        if outdata.dtype == np.int32:
+                            outdata[:] = chunk
+                        else:
+                            outdata[:] = chunk.astype(outdata.dtype)
                         self._pos = end
                     else:
-                        rem = dlen - pos
-                        if rem > 0: outdata[:rem] = self._processed[pos:]
+                        if rem > 0:
+                            chunk = self._processed[pos:]
+                            if outdata.dtype == np.int32:
+                                outdata[:rem] = chunk
+                            else:
+                                outdata[:rem] = chunk.astype(outdata.dtype)
                         outdata[rem:] = 0
                         self._playing = False; self._paused = False; self._pos = 0
                         self._track_end_flag = True
@@ -823,6 +867,7 @@ class AudioEngine:
             except Exception: pass
             self._stream = None
             WindowsAudioOptimizations.revert_mmcss()
+            WindowsAudioOptimizations.restore_power()
             self._mmcss_set = False
 
     def seek(self, ratio: float):
